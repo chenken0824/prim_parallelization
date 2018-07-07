@@ -1,0 +1,225 @@
+import os
+import random
+from optparse import OptionParser
+import math
+import time
+from pyspark import SparkContext
+from pyspark import SparkConf
+
+#os.environ["SPARK_HOME"]='...'
+#os.environ['PYSPARK_PYTHON']='...'
+
+'''
+How to run the program:
+python MST_code.py 
+--input /home/spark/data           输入文件的全路径
+--algorithm prim                   表示用哪种算法跑程序，prim或者kruskal
+--node_count 10                    边的个数，编号依次为[0, node_count)
+[
+--app_name app_name                应用名称
+--master local                     程序所在的集群
+--partitions 10                    表示跑prim算法的并行度，默认是4
+]
+'''
+
+
+class UnionSet:
+    def __init__(self, n):
+        self.set = {}
+        self.rank = {}
+        for i in range(0, n):
+            self.add(i)
+
+    def add(self, x):
+        self.set[x] = x
+        self.rank[x] = 0
+
+    def find(self, x):
+        if self.set[x] == x:
+            return x
+
+        return self.find(self.set[x])
+
+    def union(self, x, y):
+        p1 = self.find(x)
+        p2 = self.find(y)
+        if p1 == p2:
+            return
+
+        if self.rank[p1] > self.rank[p2]:
+            self.set[p2] = p1
+        else:
+            if self.rank[p1] == self.rank[p2]:
+                self.rank[p2] = self.rank[p2] + 1
+            self.set[p1] = p2
+
+
+
+def parse_params():
+    opt = OptionParser()
+    opt.add_option('--app_name',
+                   dest='app_name',
+                   type=str,
+                   help='the application name')
+
+    opt.add_option('--master',
+                   dest='master',
+                   type=str,
+                   help='the master to connect to submit job')
+   
+    opt.add_option('--algorithm',
+                   dest='algorithm',
+                   type=str,
+                   help='kruskal or prim')
+
+    opt.add_option('--node_count',
+                   dest='node_count',
+                   type=str,
+                   help='node count in the graph')
+
+    opt.add_option('--input',
+                   dest='input',
+                   type=str,
+                   help='the full path of input file')
+    
+    opt.add_option('--partitions',
+                   dest='partitions',
+                   type=str,
+                   help='partitions for the input file')
+
+    v, a = opt.parse_args()
+    return v, a
+
+
+def output(line):
+    print line
+
+
+def do_kruskal(edges, node_count):
+    union_set = UnionSet(node_count)
+    sorted_edges = sorted(edges, key=lambda deg: deg[2])
+
+    result = []
+    for edge in sorted_edges:
+        u = edge[0]
+        v = edge[1]
+        if union_set.find(u) != union_set.find(v):
+            result.append("%s %s %d" % (u, v, edge[2]))
+            union_set.union(u, v)
+    return result
+
+
+def kruskal(input_params):
+    sc = SparkContext(conf=conf)
+    input_rdd = sc.textFile(input_params.input)
+    mst = input_rdd.map(lambda s: (0, (int(s.split(' ')[0]), int(s.split(' ')[1]), int(s.split(' ')[2])))) \
+        .groupByKey() \
+        .flatMap(lambda x: do_kruskal(x[1], int(input_params.node_count)))
+    mst.foreach(output)
+
+
+def find_minimum(edge_list, broadcast_data):
+    result = {}
+    for edge in edge_list:
+        u = edge[0]
+        v = edge[1]
+        wt = edge[2]
+        comp_u = broadcast_data[u]
+        comp_v = broadcast_data[v]
+        if comp_u != comp_v:
+            if not (comp_u in result):
+                result[comp_u] = edge
+            if not (comp_v in result):
+                result[comp_v] = edge
+
+            if result[comp_u][2] > wt:
+                result[comp_u] = edge
+
+            if result[comp_v][2] > wt:
+                result[comp_v] = edge
+    return result
+
+
+def reduce_maps(dict1, dict2):
+    result = {}
+    for key, value in dict1.items():
+        result[key] = value
+
+    for key, value in dict2.items():
+        if key in result:
+            tmp = result[key]
+            if tmp[2] > value[2]:
+                result[key] = value
+        else:
+            result[key] = value
+
+    return result
+
+
+
+def prim(input_params):
+    sc = SparkContext(conf=conf)
+    input_rdd = sc.textFile(input_params.input)
+
+    node_count = int(input_params.node_count)
+
+    partitions = 4
+    if input_params.partitions:
+        partitions = int(input_params.partitions)
+
+    nodes = range(0, node_count)
+    union_set = UnionSet(node_count)
+
+    grouped_edges = input_rdd.map(lambda s: (random.randint(0, partitions)
+                                             , (int(s.split(' ')[0]), int(s.split(' ')[1]), int(s.split(' ')[2])))) \
+        .groupByKey().map(lambda s: s[1])
+
+    mst = set()
+    current_times = 0
+    max_execute_times = int(math.log(node_count) + 1)
+    while current_times < max_execute_times:
+        tmp_data = {}
+        for i in nodes:
+            tmp_data[i] = union_set.find(i)
+        broadcast_data = sc.broadcast(tmp_data)
+
+        edge_list = grouped_edges.map(lambda s: find_minimum(s, broadcast_data.value)).reduce(lambda a, b: reduce_maps(a, b))
+        if len(edge_list) == 0:
+            break
+
+        for key, value in edge_list.items():
+            union_set.union(value[0], value[1])
+            mst.add("%d %d %d" %(value[0], value[1], value[2]))
+
+        current_times = current_times + 1
+
+    for edge in mst:
+        output(edge)
+
+
+if __name__ == '__main__':
+    values, args = parse_params()
+    conf = SparkConf()
+    if values.app_name:
+        conf.setAppName()
+    else:
+        conf.setAppName('SpanningTree')
+
+    if values.master:
+        conf.setMaster(values.master)
+    else:
+        conf.setMaster('local')
+
+    if not values.input:
+        raise Exception('input file full path should exist in the param list')
+    if not values.node_count:
+        raise Exception('node count should exist in the param list')
+
+    start = time.time()
+    if values.algorithm:
+        if values.algorithm == 'prim':
+            prim(values)
+        else:
+            kruskal(values)
+    end = time.time()
+    print 'Total time cost: %dms' % (end - start)
